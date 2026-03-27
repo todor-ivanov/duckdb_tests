@@ -26,12 +26,12 @@ CREATE TABLE PilotAttributes (
 );
 """)
 
-start_date = datetime.now() - timedelta(days=90)
+start_date = datetime.now() - timedelta(days=700)
 end_date = datetime.now()
 
-NUM_PILOTS = 1_000_000
+NUM_PILOTS = 50_000_000
 
-day_weights = np.array([0.01] * 60 + [0.02] * 20 + [0.03] * 10)
+day_weights = np.array([0.01] * 400 + [0.03] * 250 + [0.02] * 50)
 day_weights = day_weights / day_weights.sum()
 status_weights = np.array([0.5, 0.1, 0.39, 0.01])
 status_weights = status_weights / status_weights.sum()
@@ -43,7 +43,7 @@ memory_weights = memory_weights / memory_weights.sum()
 rng = np.random.default_rng()
 df = pl.DataFrame(
     {
-        "days": rng.choice(90, size=NUM_PILOTS, p=day_weights),
+        "days": rng.choice(700, size=NUM_PILOTS, p=day_weights),
         "hours": rng.integers(0, 25, size=NUM_PILOTS),
         "minutes": rng.integers(0, 61, size=NUM_PILOTS),
         "seconds": rng.integers(0, 61, size=NUM_PILOTS),
