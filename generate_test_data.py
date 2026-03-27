@@ -1,16 +1,14 @@
 import duckdb
-import random
+import polars as pl
+import numpy as np
 from datetime import datetime, timedelta
 
-# Create an in-memory DuckDB database
 conn = duckdb.connect(database=":memory:")
 
-# Create the sequence
 conn.execute("""
 CREATE SEQUENCE IF NOT EXISTS pilot_ids START 1;
 """)
 
-# Create the 'Pilots' table
 conn.execute("""
 CREATE TABLE Pilots (
     PilotID INTEGER PRIMARY KEY DEFAULT nextval('pilot_ids'),
@@ -19,7 +17,6 @@ CREATE TABLE Pilots (
 );
 """)
 
-# Create the 'PilotAttributes' table
 conn.execute("""
 CREATE TABLE PilotAttributes (
     PilotID INTEGER PRIMARY KEY,
@@ -29,53 +26,48 @@ CREATE TABLE PilotAttributes (
 );
 """)
 
-# Generate random data for the last days
 start_date = datetime.now() - timedelta(days=90)
 end_date = datetime.now()
 
+NUM_PILOTS = 1_000_000
 
-def random_multiple_of_x(x=1, from_n=1, to_n=1000, weights=None):
-    """helper to generate random data into 'Pilots' and 'PilotAttributes'"""
-    # Calculate the number of steps between from_n and to_n
-    steps = (to_n - from_n) // x + 1
+day_weights = np.array([0.01] * 60 + [0.02] * 20 + [0.03] * 10)
+day_weights = day_weights / day_weights.sum()
+status_weights = np.array([0.5, 0.1, 0.39, 0.01])
+status_weights = status_weights / status_weights.sum()
+core_weights = np.array([0.6, 0.1, 0.25, 0.05])
+core_weights = core_weights / core_weights.sum()
+memory_weights = np.array([0.1, 0.3, 0.3, 0.2])
+memory_weights = memory_weights / memory_weights.sum()
 
-    # Generate a list of all possible multiples
-    multiples = [from_n + i * x for i in range(steps)]
-    # Use random.choices if weights are provided, otherwise use random.choice
-    if weights is not None:
-        return random.choices(multiples, weights=weights, k=1)[0]
-    else:
-        return random.choices(multiples)
-
-
-statuses = ["Running", "Waiting", "Done", "Failed"]
-status_weights = [0.5, 0.1, 0.39, 0.01]
-cores = [1, 8, 16, 256]
-core_weights = [0.6, 0.1, 0.25, 0.05]
-memory = [1024, 2048, 4096, 8092]
-memory_weights = [0.1, 0.3, 0.3, 0.2]
-
-NUM_PILOTS = 100_000
-
-update_times = [
-    start_date + timedelta(
-        days=random.randint(0, 1),
-        hours=random.randint(0, 24),
-        minutes=random.randint(0, 60),
-        seconds=random.randint(0, 60),
-    )
-    for _ in range(NUM_PILOTS)
-]
-status_list = random.choices(statuses, weights=status_weights, k=NUM_PILOTS)
-cores_list = random.choices(cores, weights=core_weights, k=NUM_PILOTS)
-memory_list = random.choices(memory, weights=memory_weights, k=NUM_PILOTS)
-
-conn.executemany(
-    "INSERT INTO Pilots (UpdateTime, Status) VALUES (?, ?)",
-    zip(update_times, status_list)
+rng = np.random.default_rng()
+df = pl.DataFrame(
+    {
+        "days": rng.choice(90, size=NUM_PILOTS, p=day_weights),
+        "hours": rng.integers(0, 25, size=NUM_PILOTS),
+        "minutes": rng.integers(0, 61, size=NUM_PILOTS),
+        "seconds": rng.integers(0, 61, size=NUM_PILOTS),
+        "status": rng.choice(
+            ["Running", "Waiting", "Done", "Failed"], size=NUM_PILOTS, p=status_weights
+        ),
+        "cores": rng.choice([1, 8, 16, 256], size=NUM_PILOTS, p=core_weights),
+        "memory": rng.choice(
+            [1024, 2048, 4096, 8092], size=NUM_PILOTS, p=memory_weights
+        ),
+    }
 )
-conn.executemany(
-    "INSERT INTO PilotAttributes (PilotID, Cores, MemoryMB) VALUES (?, ?, ?)",
-    zip(range(1, NUM_PILOTS + 1), cores_list, memory_list)
+
+df = df.with_columns(
+    (
+        pl.lit(start_date)
+        + pl.duration(days="days", hours="hours", minutes="minutes", seconds="seconds")
+    ).alias("update_time")
+)
+
+conn.execute(
+    "INSERT INTO Pilots (UpdateTime, Status) SELECT update_time, status FROM df"
+)
+conn.execute(
+    "INSERT INTO PilotAttributes (PilotID, Cores, MemoryMB) SELECT row_number() OVER (), cores, memory FROM df"
 )
 conn.execute("EXPORT DATABASE 'pilots' (FORMAT parquet);")
