@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Convert LHCb storage-usage CSV snapshots into typed Parquet files.
+"""Convert LHCb storage CSV snapshots into typed Parquet files.
 
-The manifest at STORAGE_LIST_URL contains daily and weekly CSV/ZST files.
-Their filenames define the time interval covered by the snapshot:
+The dataset manifest contains daily and weekly CSV/ZST files. Their filenames
+define the time interval covered by the snapshot:
 
 * storage-YYYY-MM-DD.csv.zst -> [YYYY-MM-DD, YYYY-MM-DD + 1 day)
 * storage-YYYY-WW.csv.zst    -> ISO week [Monday, next Monday)
+* storage-occupancy-YYYY-MM-DD.csv.zst -> [YYYY-MM-DD, YYYY-MM-DD + 1 day)
 
 Every exported Parquet row gets interval metadata so downstream queries can
 recreate the OpenSearch time bucket without hardcoding bucket values.
@@ -25,10 +26,9 @@ from pathlib import Path
 from urllib.request import urlopen
 
 
-STORAGE_LIST_URL = "https://lhcbdirac.s3.cern.ch/storage-usage/storage-list.json"
 BASE_URL = "https://lhcbdirac.s3.cern.ch/"
 
-COLUMNS_SQL = """
+STORAGE_USAGE_COLUMNS_SQL = """
 {
     'SEName': VARCHAR,
     'Name': VARCHAR,
@@ -48,6 +48,39 @@ COLUMNS_SQL = """
     'EventTypeID': DOUBLE
 }
 """.strip()
+
+STORAGE_OCCUPANCY_COLUMNS_SQL = """
+{
+    'SpaceReservation': VARCHAR,
+    'Total': BIGINT,
+    'Free': BIGINT,
+    'Site': VARCHAR
+}
+""".strip()
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    name: str
+    manifest_url: str
+    filename_prefix: str
+    columns_sql: str
+
+
+DATASETS = {
+    "storage-usage": DatasetConfig(
+        name="storage-usage",
+        manifest_url=BASE_URL + "storage-usage/storage-list.json",
+        filename_prefix="storage",
+        columns_sql=STORAGE_USAGE_COLUMNS_SQL,
+    ),
+    "storage-occupancy": DatasetConfig(
+        name="storage-occupancy",
+        manifest_url=BASE_URL + "storage-occupancy/storage-occupancy-list.json",
+        filename_prefix="storage-occupancy",
+        columns_sql=STORAGE_OCCUPANCY_COLUMNS_SQL,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -82,16 +115,25 @@ def parquet_path_for(download_dir: Path, manifest_path: str) -> Path:
     return download_dir / relative.parent / name
 
 
-def parse_snapshot_path(manifest_path: str, interval_kind: str, creation_time: str | None = None) -> tuple[datetime, datetime, datetime]:
+def parse_snapshot_path(
+    manifest_path: str,
+    interval_kind: str,
+    dataset: DatasetConfig,
+    creation_time: str | None = None,
+) -> tuple[datetime, datetime, datetime]:
     name = Path(manifest_path).name
-    daily = re.fullmatch(r"storage-(\d{4})-(\d{2})-(\d{2})\.csv(?:\.zst)?", name)
+    prefix = re.escape(dataset.filename_prefix)
+    daily = re.fullmatch(
+        rf"{prefix}-(\d{{4}})-(\d{{2}})-(\d{{2}})\.csv(?:\.zst)?",
+        name,
+    )
     if daily:
         start_date = date(int(daily.group(1)), int(daily.group(2)), int(daily.group(3)))
         start = datetime.combine(start_date, time.min)
         end = start + timedelta(days=1)
         return start, end, end
 
-    weekly = re.fullmatch(r"storage-(\d{4})-(\d{1,2})\.csv(?:\.zst)?", name)
+    weekly = re.fullmatch(rf"{prefix}-(\d{{4}})-(\d{{1,2}})\.csv(?:\.zst)?", name)
     if weekly:
         start_date = date.fromisocalendar(int(weekly.group(1)), int(weekly.group(2)), 1)
         start = datetime.combine(start_date, time.min)
@@ -99,7 +141,11 @@ def parse_snapshot_path(manifest_path: str, interval_kind: str, creation_time: s
         return start, end, end
 
     if interval_kind == "latest" and creation_time:
-        instant = datetime.fromisoformat(creation_time.replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+        instant = (
+            datetime.fromisoformat(creation_time.replace("Z", "+00:00"))
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
         return instant, instant, instant
 
     raise ValueError(f"cannot derive interval from {manifest_path!r}")
@@ -133,13 +179,23 @@ def filter_snapshots(
     return filtered
 
 
-def manifest_snapshots(manifest: dict, download_dir: Path, include_latest: bool, granularity: str) -> list[Snapshot]:
+def manifest_snapshots(
+    manifest: dict,
+    download_dir: Path,
+    include_latest: bool,
+    granularity: str,
+    dataset: DatasetConfig,
+) -> list[Snapshot]:
     snapshots: list[Snapshot] = []
     interval_kinds = ("weekly", "daily") if granularity == "all" else (granularity,)
 
     for interval_kind in interval_kinds:
         for manifest_path in manifest.get(interval_kind, []):
-            start, end, snapshot_time = parse_snapshot_path(manifest_path, interval_kind)
+            start, end, snapshot_time = parse_snapshot_path(
+                manifest_path,
+                interval_kind,
+                dataset,
+            )
             snapshots.append(
                 Snapshot(
                     manifest_path=manifest_path,
@@ -155,7 +211,12 @@ def manifest_snapshots(manifest: dict, download_dir: Path, include_latest: bool,
     if include_latest and manifest.get("latest"):
         latest = manifest["latest"]
         manifest_path = latest["filename"]
-        start, end, snapshot_time = parse_snapshot_path(manifest_path, "latest", latest.get("creation_time"))
+        start, end, snapshot_time = parse_snapshot_path(
+            manifest_path,
+            "latest",
+            dataset,
+            latest.get("creation_time"),
+        )
         snapshots.append(
             Snapshot(
                 manifest_path=manifest_path,
@@ -171,11 +232,16 @@ def manifest_snapshots(manifest: dict, download_dir: Path, include_latest: bool,
     return snapshots
 
 
-def local_snapshots(paths: list[Path]) -> list[Snapshot]:
+def local_snapshots(paths: list[Path], dataset: DatasetConfig) -> list[Snapshot]:
     snapshots: list[Snapshot] = []
     for path in paths:
-        interval_kind = "weekly" if re.fullmatch(r"storage-\d{4}-\d{1,2}\.csv(?:\.zst)?", path.name) else "daily"
-        start, end, snapshot_time = parse_snapshot_path(path.name, interval_kind)
+        prefix = re.escape(dataset.filename_prefix)
+        interval_kind = (
+            "weekly"
+            if re.fullmatch(rf"{prefix}-\d{{4}}-\d{{1,2}}\.csv(?:\.zst)?", path.name)
+            else "daily"
+        )
+        start, end, snapshot_time = parse_snapshot_path(path.name, interval_kind, dataset)
         snapshots.append(
             Snapshot(
                 manifest_path=path.name,
@@ -223,7 +289,12 @@ def run_duckdb(duckdb: str, sql: str) -> None:
     subprocess.run([duckdb, ":memory:", "-c", sql], check=True)
 
 
-def convert_snapshot(duckdb: str, snapshot: Snapshot, force: bool) -> None:
+def convert_snapshot(
+    duckdb: str,
+    snapshot: Snapshot,
+    force: bool,
+    dataset: DatasetConfig,
+) -> None:
     if snapshot.parquet_path.exists() and not force:
         return
 
@@ -233,7 +304,7 @@ read_csv(
     {sql_literal(snapshot.local_path)},
     delim = ',',
     header = true,
-    columns = {COLUMNS_SQL},
+    columns = {dataset.columns_sql},
     ignore_errors = true
 )
 """.strip()
@@ -257,7 +328,13 @@ FROM {read_csv}
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--download-dir", default="data", type=Path)
-    parser.add_argument("--manifest-url", default=STORAGE_LIST_URL)
+    parser.add_argument(
+        "--dataset",
+        choices=tuple(DATASETS),
+        default="storage-usage",
+        help="Dataset manifest/schema to ingest",
+    )
+    parser.add_argument("--manifest-url", help="Override the selected dataset manifest URL")
     parser.add_argument("--duckdb", help="Path to the duckdb CLI")
     parser.add_argument(
         "--granularity",
@@ -285,13 +362,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    dataset = DATASETS[args.dataset]
+    manifest_url = args.manifest_url or dataset.manifest_url
     duckdb = duckdb_command(args.duckdb)
 
     if args.local_files is not None:
-        snapshots = local_snapshots(args.local_files)
+        snapshots = local_snapshots(args.local_files, dataset)
     else:
-        manifest = load_manifest(args.manifest_url)
-        snapshots = manifest_snapshots(manifest, args.download_dir, args.include_latest, args.granularity)
+        manifest = load_manifest(manifest_url)
+        snapshots = manifest_snapshots(
+            manifest,
+            args.download_dir,
+            args.include_latest,
+            args.granularity,
+            dataset,
+        )
 
     snapshots.sort(key=lambda item: (item.period_start, item.period_end, item.manifest_path))
     from_time = parse_filter_bound(args.from_date) if args.from_date else None
@@ -304,7 +389,7 @@ def main() -> int:
         if args.local_files is None:
             download_snapshot(snapshot, args.force_download)
         print(f"[{index}/{len(snapshots)}] writing {snapshot.parquet_path}", flush=True)
-        convert_snapshot(duckdb, snapshot, args.overwrite_parquet)
+        convert_snapshot(duckdb, snapshot, args.overwrite_parquet, dataset)
 
     print(f"converted {len(snapshots)} snapshot(s) to parquet", flush=True)
     return 0
